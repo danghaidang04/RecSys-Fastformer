@@ -4,20 +4,14 @@ Fastformer model refers to [fastformer](https://github.com/wuch15/Fastformer) <b
 PLM structure refers to [PLM4Rec](https://github.com/wuch15/PLM4NewsRec) and [speedy_mind](https://github.com/microsoft/SpeedyRec/tree/main/speedy_mind)<br>
 After cloning this repo, you can conduct experiments with following commands:
 
-## Results on MIND
-| models   | AUC    | MRR    | nDCG@5 | nDCG@10 |
-|----------|--------|--------|--------|---------|
-| official | 0.7268 | 0.3745 | 0.4151 | 0.4684  |
-| ours     | 0.7256 | 0.3720 | 0.4101 | 0.4660  |
-
 
 ## Requirements
-```bash
-Python==3.6
-transformers==4.6.0
-tensforlow==1.15
-scikit-learn==0.23
-```
+To run this project on modern hardware, use the following specifications:
+
+- **Python:** 3.10 (Recommended)
+- **PyTorch:** 2.0.1+ (with CUDA 11.8 or 12.1)
+- **Transformers:** 4.30.2
+- **Other libs:** scikit-learn, pandas, tqdm, tensorflow (for evaluation)
 
 ## Preparing Data
 Download data from MIND [link](https://msnews.github.io/) and decompress these files. You will get three files:
