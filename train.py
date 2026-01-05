@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import time
 import logging
 import random
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import sys
 import traceback
+import json
 
 import torch
 from tqdm.auto import tqdm
@@ -44,11 +46,17 @@ def ddp_train_vd(args):
     data_files = mp.Manager().list([])
     end_dataloder = mp.Manager().Value('b', False)
     end_train = mp.Manager().Value('b', False)
-    mp.spawn(train,
-             args=(
-             args, cache_state, data_files, end_dataloder, end_train),
-             nprocs=args.world_size,
-             join=True)
+    
+    # Nếu chỉ có 1 GPU/process, chạy trực tiếp không cần distributed
+    if args.world_size == 1:
+        logging.info("world_size=1, running in single-GPU mode (no distributed)")
+        train(0, args, cache_state, data_files, end_dataloder, end_train, dist_training=False)
+    else:
+        mp.spawn(train,
+                 args=(
+                 args, cache_state, data_files, end_dataloder, end_train),
+                 nprocs=args.world_size,
+                 join=True)
 
 
 def train(local_rank,
@@ -116,6 +124,18 @@ def train(local_rank,
         all_num = 1
         encode_num = 0
         cache = np.zeros((len(news_combined),args.news_dim))
+        
+        # Metrics tracking for plotting
+        metrics_history = {
+            'epochs': [],
+            'train_loss': [],
+            'train_acc': [],
+            'dev_auc': [],
+            'dev_mrr': [],
+            'dev_ndcg5': [],
+            'dev_ndcg10': []
+        }
+        
         for ep in range(args.epochs):
             with only_on_main_process(local_rank, barrier) as need:
                 if need:
@@ -185,9 +205,13 @@ def train(local_rank,
                         encode_vecs = None
 
                     all_tensors = [torch.empty_like(encode_vecs) for _ in range(args.world_size)]
-                    dist.all_gather(all_tensors, encode_vecs)
-                    all_tensors[local_rank] = encode_vecs
-                    all_encode_vecs = torch.cat(all_tensors, dim=0)
+                    if dist_training:
+                        dist.all_gather(all_tensors, encode_vecs)
+                        all_tensors[local_rank] = encode_vecs
+                        all_encode_vecs = torch.cat(all_tensors, dim=0)
+                    else:
+                        # Single GPU mode: no need to gather
+                        all_encode_vecs = encode_vecs
                     news_vecs = torch.cat([cache_vec, all_encode_vecs], 0)
 
                     all_num += all_encode_vecs.size(0)
@@ -241,6 +265,11 @@ def train(local_rank,
                     logging.info(f"Model saved to {ckpt_path}")
 
             logging.info('epoch:{}, time:{}, encode_num:{}'.format(ep + 1, time.time() - start_time-test_time, encode_num))
+            
+            # Calculate epoch-level train metrics
+            epoch_train_loss = loss / max(global_step % args.log_steps, 1) if global_step > 0 else 0
+            epoch_train_acc = accuary / max(global_step % args.log_steps, 1) if global_step > 0 else 0
+            
             # save model after an epoch
             if local_rank == 0:
                 ckpt_path = os.path.join(args.model_dir, '{}-epoch-{}.pt'.format(args.savename, ep + 1))
@@ -253,15 +282,34 @@ def train(local_rank,
                     }, ckpt_path)
                 logging.info(f"Model saved to {ckpt_path}")
 
-                auc = test(model, args, device, news_info.category_dict, news_info.subcategory_dict)
+                # Evaluate on dev set
+                dev_metrics = test(model, args, device, news_info.category_dict, news_info.subcategory_dict)
                 ddp_model.train()
+                
+                auc = dev_metrics['auc']
+                
+                # Track metrics
+                metrics_history['epochs'].append(ep + 1)
+                metrics_history['train_loss'].append(float(epoch_train_loss))
+                metrics_history['train_acc'].append(float(epoch_train_acc))
+                metrics_history['dev_auc'].append(dev_metrics['auc'])
+                metrics_history['dev_mrr'].append(dev_metrics['mrr'])
+                metrics_history['dev_ndcg5'].append(dev_metrics['ndcg5'])
+                metrics_history['dev_ndcg10'].append(dev_metrics['ndcg10'])
+                
+                # Save metrics history to JSON
+                metrics_path = os.path.join(args.model_dir, f'{args.savename}_metrics.json')
+                with open(metrics_path, 'w') as f:
+                    json.dump(metrics_history, f, indent=2)
+                logging.info(f"Metrics saved to {metrics_path}")
+                logging.info(f"Epoch {ep+1} - Dev AUC: {auc:.4f}, MRR: {dev_metrics['mrr']:.4f}, nDCG@5: {dev_metrics['ndcg5']:.4f}, nDCG@10: {dev_metrics['ndcg10']:.4f}")
 
                 if auc>best_auc:
                     best_auc = auc
                 else:
                     best_count += 1
-                    if best_auc >= 3:
-                        logging.info("best_auc:{}, best_ep:{}".format(best_auc, ep-3))
+                    if best_count >= 3:
+                        logging.info("best_auc:{}, best_ep:{}".format(best_auc, ep-2))
                         end_train.value = True
             barrier()
             if end_train.value:
@@ -278,6 +326,10 @@ def train(local_rank,
 
 
 def test(model, args, device, category_dict, subcategory_dict):
+    """
+    Evaluate model on dev set.
+    Returns: dict with AUC, MRR, nDCG5, nDCG10
+    """
     model.eval()
 
     with torch.no_grad():
@@ -303,6 +355,7 @@ def test(model, args, device, category_dict, subcategory_dict):
         results.add_metric_dict('all users')
         results.add_metric_dict('cold users')
 
+        cnt = 0
         for cnt, (log_vecs, log_mask, news_vecs, labels) in enumerate(dataloader):
             his_lens = torch.sum(log_mask, dim=-1).to(torch.device("cpu")).detach().numpy()
 
@@ -328,16 +381,18 @@ def test(model, args, device, category_dict, subcategory_dict):
                 if his_len <= 5:
                     results.update_metric_dict('cold users', metric_rslt)
 
-            # if cnt % args.log_steps == 0:
-            #     results.print_metrics(0, cnt * args.batch_size, 'all users')
-            #     results.print_metrics(0, cnt * args.batch_size, 'cold users')
-
         dataloader.join()
-        for i in range(2):
-            results.print_metrics(0, cnt * args.batch_size, 'all users')
-            results.print_metrics(0, cnt * args.batch_size, 'cold users')
+        results.print_metrics(0, cnt * args.batch_size, 'all users')
+        results.print_metrics(0, cnt * args.batch_size, 'cold users')
 
-    return np.mean(results.metrics_dict["all users"]['AUC'])
+    # Return dict with all metrics
+    all_users = results.metrics_dict["all users"]
+    return {
+        'auc': np.mean(all_users['AUC']) if all_users['AUC'] else 0.0,
+        'mrr': np.mean(all_users['MRR']) if all_users['MRR'] else 0.0,
+        'ndcg5': np.mean(all_users['nDCG5']) if all_users['nDCG5'] else 0.0,
+        'ndcg10': np.mean(all_users['nDCG10']) if all_users['nDCG10'] else 0.0,
+    }
 
 
 if __name__ == '__main__':

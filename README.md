@@ -1,103 +1,269 @@
-# Fastformer for recommandation (Unofficial)
-This example walks through the training and prediction of unilm-fastformer on MIND dataset. <br> 
-Fastformer model refers to [fastformer](https://github.com/wuch15/Fastformer) <br>
-PLM structure refers to [PLM4Rec](https://github.com/wuch15/PLM4NewsRec) and [speedy_mind](https://github.com/microsoft/SpeedyRec/tree/main/speedy_mind)<br>
-After cloning this repo, you can conduct experiments with following commands:
+# Fastformer for News Recommendation
 
+This repository implements **Fastformer** for news recommendation on the MIND dataset.
+
+Based on:
+- [Fastformer](https://github.com/wuch15/Fastformer)
+- [PLM4NewsRec](https://github.com/wuch15/PLM4NewsRec)
+- [SpeedyRec](https://github.com/microsoft/SpeedyRec/tree/main/speedy_mind)
+
+---
+
+## Table of Contents
+1. [Requirements](#requirements)
+2. [Project Structure](#project-structure)
+3. [Data Preparation](#data-preparation)
+4. [Training](#training)
+5. [Evaluation](#evaluation)
+6. [Plotting Metrics](#plotting-metrics)
+7. [Troubleshooting](#troubleshooting)
+
+---
 
 ## Requirements
-To run this project on modern hardware, use the following specifications:
 
-- **Python:** 3.10 (Recommended)
-- **PyTorch:** 2.0.1+ (with CUDA 11.8 or 12.1)
-- **Transformers:** 4.30.2
-- **Other libs:** scikit-learn, pandas, tqdm, tensorflow (for evaluation)
+### Python Environment
+```bash
+# Create conda environment
+conda create -n fastformer python=3.10 -y
+conda activate fastformer
 
-## Preparing Data
-Download data from MIND [link](https://msnews.github.io/) and decompress these files. You will get three files:
-`MINDlarge_train`, `MINDlarge_dev`, and `MINDlarge_test`, then put them in the same folder, e.g., `./data/`. 
-
-Script `data_generation.py` can help you to generate the data files which meet the need of SpeedyRec:
+# Install dependencies
+pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu118
+pip install transformers==4.30.2
+pip install tensorflow
+pip install scikit-learn pandas tqdm matplotlib
 ```
-python data_generation.py --raw_data_path {./data or other path you save the decompressed data}
-```
-The processed data will be saved to `./data/speedy_data/`.
 
-## Training 
+### Hardware
+- **GPU**: NVIDIA GPU with at least 10GB VRAM (tested on RTX A6000)
+- **CPU**: Also works on CPU (slower)
+
+---
+
+## Project Structure
+
 ```
+fastformer-for-rec/
+├── data/
+│   └── speedy_data/          # Processed data
+│       ├── train/            # Training data (ProtoBuf_*.tsv)
+│       └── dev/              # Validation data (ProtoBuf_*.tsv)
+├── models/
+│   └── bert-tiny/            # Pretrained model (config.json, vocab.txt, etc.)
+├── saved_models/             # Saved checkpoints & metrics
+├── train.py                  # Training script
+├── evaluate_dev.py           # Evaluation on dev set
+├── submission.py             # Generate submission for leaderboard
+├── plot_metrics.py           # Plot training metrics
+├── data_generation.py        # Preprocess raw MIND data
+└── README.md
+```
+
+---
+
+## Data Preparation
+
+### Step 1: Download MIND Dataset
+Download from [MIND official page](https://msnews.github.io/):
+- `MINDlarge_train.zip`
+- `MINDlarge_dev.zip`
+
+Extract to a folder, e.g., `./data/`:
+```
+data/
+├── MINDlarge_train/
+│   ├── news.tsv
+│   └── behaviors.tsv
+└── MINDlarge_dev/
+    ├── news.tsv
+    └── behaviors.tsv
+```
+
+### Step 2: Generate Processed Data
+```bash
+python data_generation.py --raw_data_path ./data
+```
+
+This creates `./data/speedy_data/` with:
+- `train/ProtoBuf_*.tsv` - Training samples
+- `dev/ProtoBuf_*.tsv` - Validation samples
+- `*_preprocessed_docs.pkl` - Cached news features
+
+### Step 3: Download Pretrained Model
+
+Run the download script to automatically download a lightweight BERT model:
+
+```bash
+python download_model.py
+```
+
+This downloads `bert-tiny` (~17MB) to `./models/bert-tiny/` with all necessary files:
+- `config.json`
+- `pytorch_model.bin` (or `model.safetensors`)
+- `vocab.txt`
+- `tokenizer_config.json`
+
+> **Note**: For better performance, you can modify `download_model.py` to use larger models like `bert-base-uncased` or `microsoft/deberta-base`.
+
+---
+
+## Training
+
+### Single GPU Training
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --pretrained_model_path ./models/bert-tiny \
+  --root_data_dir ./data/speedy_data/ \
+  --filename_pat "ProtoBuf_*.tsv" \
+  --epochs 5 \
+  --world_size 1 \
+  --batch_size 16 \
+  --log_steps 100 \
+  --news_dim 256 \
+  --lr 1e-4 \
+  --pretrain_lr 8e-6 \
+  --savename my_fastformer
+```
+
+### Multi-GPU Training (Distributed)
+```bash
 python train.py \
---pretreained_model unilm \
---pretrained_model_path {path to ckpt of unilmv2} \
---root_data_dir ./data/speedy_data/ \
---num_hidden_layers 8 \
---world_size 4 \
---lr 1e-4 \
---pretrain_lr 8e-6 \
---warmup True \
---schedule_step 240000 \
---warmup_step 1000 \
---batch_size 42 \
---npratio 4 \
---beta_for_cache 0.002 \
---max_step_in_cache 2 \
---savename speedyrec_mind \
---news_dim 256
-```
-The model will be saved to `./saved_models/`, and validation will be conducted after each epoch.   
-The default pretrained model is UniLM v2, and you can get it from [unilm repo](https://github.com/microsoft/unilm). For other pretrained model, you need set `--pretrained_model==others` and give a new path for `--pretrained_model_path`
-(like `roberta-base` and `microsoft/deberta-base`, which needs to be supported by [transformers](https://huggingface.co/transformers/model_doc/auto.html?highlight=automodel#transformers.AutoModel)).
-
-
-
-## Prediction
-Run prediction using saved checkpoint:
-```
-python submission.py \
---pretrained_model_path {path to ckpt of unilmv2} \
---pretreained_model unilm \
---root_data_dir ./data/speedy_data/ \
---num_hidden_layers 8 \
---load_ckpt_name {path to your saved model} \
---batch_size 256 \
---news_dim 256
-```
-It will creates a zip file:`predciton.zip`, which can be submitted to the leaderboard of MIND directly.  
-
-## Training and prediction based on our trained model 
-You can download the config and the model trained by us from this [link](https://rec.ustc.edu.cn/share/2d76b930-3955-11ed-af65-11758bdcd0e4) and save them in `./speedymind_ckpts`.  
-- Prediction  
-You can run the prediction by following command:
-```
-python submission.py \
---pretrained_model_path ./speedymind_ckpts \
---pretreained_model unilm \
---root_data_dir ./data/speedy_data/ \
---num_hidden_layers 8 \
---load_ckpt_name ./speedymind_ckpts/fastformer4rec.pt \
---batch_size 256 \
---news_attributes title  \
---news_dim 256
+  --pretrained_model_path ./models/bert-tiny \
+  --root_data_dir ./data/speedy_data/ \
+  --filename_pat "ProtoBuf_*.tsv" \
+  --epochs 5 \
+  --world_size 4 \
+  --batch_size 42 \
+  --log_steps 100 \
+  --news_dim 256 \
+  --savename my_fastformer_ddp
 ```
 
-- Training  
-If you want to finetune the model, set `--pretrained_model_path ./speedymind_ckpts --news_attributes title` and run the training command. Here is an example: 
+### Key Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--pretrained_model_path` | Path to pretrained BERT model | Required |
+| `--root_data_dir` | Path to processed data | Required |
+| `--epochs` | Number of training epochs | 6 |
+| `--world_size` | Number of GPUs (1 for single GPU) | -1 (all) |
+| `--batch_size` | Batch size per GPU | 64 |
+| `--news_dim` | News embedding dimension | 256 |
+| `--lr` | Learning rate for model | 1e-4 |
+| `--pretrain_lr` | Learning rate for pretrained encoder | 1e-4 |
+| `--log_steps` | Log every N steps | 200 |
+| `--savename` | Name prefix for saved models | speedy |
+
+### Output
+- Checkpoints: `./saved_models/{savename}-epoch-{N}.pt`
+- Metrics JSON: `./saved_models/{savename}_metrics.json`
+
+---
+
+## Evaluation
+
+### Evaluate on Dev Set
+```bash
+CUDA_VISIBLE_DEVICES=0 python evaluate_dev.py \
+  --pretrained_model_path ./models/bert-tiny \
+  --root_data_dir ./data/speedy_data/ \
+  --load_ckpt_name ./saved_models/my_fastformer-epoch-5.pt \
+  --batch_size 64 \
+  --news_dim 256
 ```
-python train.py \
---pretreained_model unilm \
---pretrained_model_path ./speedymind_ckpts \
---root_data_dir ./data/speedy_data/ \
---news_attributes title \
---num_hidden_layers 8 \
---world_size 4 \
---lr 1e-4 \
---pretrain_lr 8e-6 \
---warmup True \
---schedule_step 240000 \
---warmup_step 1000 \
---batch_size 42 \
---npratio 4 \
---beta_for_cache 0.002 \
---max_step_in_cache 2 \
---savename speedyrec_mind \
---news_dim 256
+
+### Expected Output
 ```
+[INFO] FINAL RESULTS ON DEV SET:
+[INFO] [0] all users Ed: 73088: 61.01   26.38   28.84   35.39
+                          ^AUC    ^MRR   ^nDCG@5 ^nDCG@10
+[INFO] Final AUC on dev set: 0.6101
+```
+
+### Generate Submission (for MIND Leaderboard)
+```bash
+CUDA_VISIBLE_DEVICES=0 python submission.py \
+  --pretrained_model_path ./models/bert-tiny \
+  --root_data_dir ./data/speedy_data/ \
+  --load_ckpt_name ./saved_models/my_fastformer-epoch-5.pt \
+  --batch_size 256 \
+  --news_dim 256
+```
+
+This creates `prediction.zip` for submission.
+
+---
+
+## Plotting Metrics
+
+After training, plot the metrics:
+
+```bash
+# Save plot to file
+python plot_metrics.py \
+  --metrics_file ./saved_models/my_fastformer_metrics.json \
+  --output training_curves.png
+
+# Or show interactively
+python plot_metrics.py \
+  --metrics_file ./saved_models/my_fastformer_metrics.json
+```
+
+### Output
+- 4 subplots: Train Loss, Train Accuracy, Dev AUC/MRR, Dev nDCG
+- Summary table in console
+
+---
+
+## Troubleshooting
+
+### 1. CUDA Out of Memory
+- Reduce `--batch_size`
+- Use smaller model (`bert-tiny` instead of `bert-base`)
+
+### 2. Training Hangs (world_size=1)
+- Make sure you use `CUDA_VISIBLE_DEVICES=X` to specify GPU
+- The code automatically uses single-GPU mode when `world_size=1`
+
+### 3. "nan" Metrics on Dev Set
+- Check that `--news_dim` matches training (default: 256)
+- Ensure data files exist in `./data/speedy_data/dev/`
+
+### 4. Tokenizer Warning
+The warning about `BertTokenizer` vs `TuringNLRv3Tokenizer` is expected and can be ignored.
+
+---
+
+## Metrics Reference
+
+| Metric | Description |
+|--------|-------------|
+| **AUC** | Area Under ROC Curve (higher = better) |
+| **MRR** | Mean Reciprocal Rank (higher = better) |
+| **nDCG@5** | Normalized DCG at top 5 (higher = better) |
+| **nDCG@10** | Normalized DCG at top 10 (higher = better) |
+
+### Baseline Results (bert-tiny, 1 epoch)
+| AUC | MRR | nDCG@5 | nDCG@10 |
+|-----|-----|--------|---------|
+| 61.01 | 26.38 | 28.84 | 35.39 |
+
+---
+
+## Citation
+
+If you use this code, please cite:
+```bibtex
+@article{wu2021fastformer,
+  title={Fastformer: Additive Attention Can Be All You Need},
+  author={Wu, Chuhan and Wu, Fangzhao and Qi, Tao and Huang, Yongfeng},
+  journal={arXiv preprint arXiv:2108.09084},
+  year={2021}
+}
+```
+
+---
+
+## License
+MIT License

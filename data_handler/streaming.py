@@ -9,20 +9,42 @@ from concurrent.futures import ThreadPoolExecutor
 import sys
 import traceback
 
+# def get_files(dirname, filename_pat="*", recursive=False):
+#     if not tf.io.gfile.exists(dirname):
+#         logging.warning(f"no file in {dirname} !")
+#         return None
+#     files = []
+#     print(dirname)
+#     for x in tf.io.gfile.listdir(dirname):
+#         path = os.path.join(dirname, x)
+#         if tf.io.gfile.isdir(path):
+#             if recursive:
+#                 files.extend(get_files(path, filename_pat))
+#         elif fnmatch.fnmatch(x, filename_pat):
+#             files.append(path)
+#     print()
+#     return files
+
 def get_files(dirname, filename_pat="*", recursive=False):
-    if not tf.io.gfile.exists(dirname):
+    if not os.path.exists(dirname):
         logging.warning(f"no file in {dirname} !")
-        return None
+        return []
+    
     files = []
-    print(dirname)
-    for x in tf.io.gfile.listdir(dirname):
-        path = os.path.join(dirname, x)
-        if tf.io.gfile.isdir(path):
-            if recursive:
-                files.extend(get_files(path, filename_pat))
-        elif fnmatch.fnmatch(x, filename_pat):
-            files.append(path)
-    print()
+    # Sử dụng glob để tìm file theo pattern một cách chính xác nhất
+    import glob
+    search_path = os.path.join(dirname, filename_pat)
+    files = glob.glob(search_path)
+    
+    # Nếu dùng glob không ra, thử lại bằng cách quét danh sách
+    if not files:
+        for x in os.listdir(dirname):
+            path = os.path.join(dirname, x)
+            if os.path.isfile(path) and fnmatch.fnmatch(x, filename_pat):
+                files.append(path)
+                
+    # Chuyển đổi sang đường dẫn tuyệt đối để tránh lỗi với TF Dataset
+    files = [os.path.abspath(p) for p in files]
     return files
 
 
@@ -51,44 +73,134 @@ def get_worker_files(dirnames,
     return files
 
 
+# class StreamReader:
+#     def __init__(self, data_paths, batch_size, shuffle=False, shuffle_buffer_size=1000):
+#         tf.config.experimental.set_visible_devices([], device_type="GPU")
+#         logging.info(f"visible_devices:{tf.config.experimental.get_visible_devices()}")
+#         path_len = len(data_paths)
+# 
+#         dataset = tf.data.Dataset.list_files(data_paths, shuffle=False).interleave(
+#             lambda x: tf.data.TextLineDataset(x).map(lambda y: tf.strings.join([y, x], separator="\t")),
+#             cycle_length=path_len,
+#             block_length=batch_size,
+#             # num_parallel_calls=min(path_len, batch_size),
+#         )
+# 
+#         dataset = dataset.batch(batch_size)
+#         dataset = dataset.prefetch(3)
+#         if tf.__version__.startswith('1.'):
+#             self.iterator = dataset.make_one_shot_iterator()
+#             self.next_batch = self.iterator.get_next()
+#         else:
+#             # Đối với TensorFlow 2.x
+#             self.iterator = iter(dataset)
+#             self.next_batch = next(self.iterator)
+#         #self.next_batch = dataset.make_one_shot_iterator().get_next()
+#         self.session = None
+
+
+#     # def reset(self):
+#     #     # print(f"StreamReader reset(), {self.session}, pid:{threading.currentThread()}")
+#     #     if self.session:
+#     #         self.session.close()
+#     #     self.session = tf.Session()
+#     #     self.endofstream = False
+#     def reset(self):
+#         import tensorflow as tf
+#         # Kiểm tra nếu là TF 2.x
+#         if not tf.__version__.startswith('1.'):
+#             # Trong TF 2.x, không cần Session. Chỉ cần khởi tạo lại iterator.
+#             self.iterator = iter(self.dataset)
+#             self.session = None 
+#         else:
+#             # Code cũ cho TF 1.x
+#             self.session = tf.Session()
+#             # Nếu có iterator cần initialize thì chạy ở đây
+#             # self.session.run(self.iterator.initializer)
+
+#     def get_next(self):
+#         try:
+#             ret = self.session.run(self.next_batch)
+#         except tf.errors.OutOfRangeError:
+#             self.endofstream = True
+#             return None
+#         return ret
+
+#     def reach_end(self):
+#         # print(f"StreamReader reach_end(), {self.endofstream}")
+#         return self.endofstream
 class StreamReader:
     def __init__(self, data_paths, batch_size, shuffle=False, shuffle_buffer_size=1000):
         tf.config.experimental.set_visible_devices([], device_type="GPU")
         logging.info(f"visible_devices:{tf.config.experimental.get_visible_devices()}")
+        
+        # DEBUG: Log input paths
+        logging.info(f"[StreamReader] Init with {len(data_paths)} files. First file: {data_paths[0] if data_paths else 'None'}")
+        
         path_len = len(data_paths)
+        if path_len == 0:
+            logging.warning("[StreamReader] No files to read from!")
+            self.dataset = None
+            self.endofstream = True
+            return
 
         dataset = tf.data.Dataset.list_files(data_paths, shuffle=False).interleave(
             lambda x: tf.data.TextLineDataset(x).map(lambda y: tf.strings.join([y, x], separator="\t")),
             cycle_length=path_len,
             block_length=batch_size,
-            # num_parallel_calls=min(path_len, batch_size),
         )
 
         dataset = dataset.batch(batch_size)
         dataset = dataset.prefetch(3)
-        self.next_batch = dataset.make_one_shot_iterator().get_next()
+        
+        self.dataset = dataset  # Quan trọng: Lưu lại để reset iterator
+        self.endofstream = False
         self.session = None
-
+        
+        if tf.__version__.startswith('1.'):
+            self.iterator = dataset.make_one_shot_iterator()
+            self.next_batch = self.iterator.get_next()
+        else:
+            # TF 2.x dùng iterator trực tiếp
+            self.iterator = iter(dataset)
+            self.next_batch = None
+        
+        logging.info("[StreamReader] Iterator created.")
 
     def reset(self):
-        # print(f"StreamReader reset(), {self.session}, pid:{threading.currentThread()}")
-        if self.session:
-            self.session.close()
-        self.session = tf.Session()
         self.endofstream = False
+        if tf.__version__.startswith('1.'):
+            if self.session:
+                self.session.close()
+            self.session = tf.Session()
+        else:
+            if self.dataset:
+                self.iterator = iter(self.dataset)
 
     def get_next(self):
-        try:
-            ret = self.session.run(self.next_batch)
-        except tf.errors.OutOfRangeError:
-            self.endofstream = True
+        if self.endofstream or not hasattr(self, 'dataset') or self.dataset is None:
             return None
-        return ret
+            
+        if not tf.__version__.startswith('1.'):
+            try:
+                # TF 2.x: Dùng hàm next() của Python
+                batch = next(self.iterator)
+                if hasattr(batch, 'numpy'):
+                    return batch.numpy()
+                return batch
+            except (StopIteration, tf.errors.OutOfRangeError):
+                self.endofstream = True
+                # logging.info("[StreamReader] End of stream reached.")
+                return None
+        else:
+            try:
+                return self.session.run(self.next_batch)
+            except tf.errors.OutOfRangeError:
+                self.endofstream = True
+                return None
 
     def reach_end(self):
-        # print(f"StreamReader reach_end(), {self.endofstream}")
         return self.endofstream
-
 
 class StreamSampler:
     def __init__(
@@ -230,27 +342,70 @@ class StreamSamplerTrainForSpeedyRec:
 
 
 
+# class StreamReaderTest(StreamReader):
+#     def __init__(self, data_paths, batch_size, shuffle, shuffle_buffer_size=1000):
+#         tf.config.experimental.set_visible_devices([], device_type="GPU")
+#         # logging.info(f"visible_devices:{tf.config.experimental.get_visible_devices()}")
+#         path_len = len(data_paths)
+#         # logging.info(f"[StreamReader] path_len:{path_len}, paths: {data_paths}")
+#         dataset = tf.data.Dataset.list_files(data_paths).interleave(
+#             lambda x: tf.data.TextLineDataset(x).map(lambda y: tf.strings.join([y, x], separator="\t")),
+#             cycle_length=path_len,
+#             block_length=batch_size,
+#             num_parallel_calls=min(path_len, batch_size),
+#         )
+
+#         # if shuffle:
+#         #     dataset = dataset.shuffle(shuffle_buffer_size, reshuffle_each_iteration=True)
+        
+#         dataset = dataset.batch(batch_size)
+#         dataset = dataset.prefetch(1)
+#         self.next_batch = dataset.make_one_shot_iterator().get_next()
+#         self.session = None
 class StreamReaderTest(StreamReader):
     def __init__(self, data_paths, batch_size, shuffle, shuffle_buffer_size=1000):
         tf.config.experimental.set_visible_devices([], device_type="GPU")
-        # logging.info(f"visible_devices:{tf.config.experimental.get_visible_devices()}")
+        
+        # DEBUG LOGGING
+        logging.info(f"[StreamReaderTest] Init with {len(data_paths)} files. First file: {data_paths[0] if data_paths else 'None'}")
+        
         path_len = len(data_paths)
-        # logging.info(f"[StreamReader] path_len:{path_len}, paths: {data_paths}")
+        if path_len == 0:
+            logging.warning("[StreamReaderTest] No files to read from!")
+            self.dataset = None
+            self.endofstream = True
+            return
+
+        
         dataset = tf.data.Dataset.list_files(data_paths).interleave(
             lambda x: tf.data.TextLineDataset(x).map(lambda y: tf.strings.join([y, x], separator="\t")),
             cycle_length=path_len,
             block_length=batch_size,
-            num_parallel_calls=min(path_len, batch_size),
+            num_parallel_calls=min(path_len, batch_size) if path_len > 0 else 1,
         )
 
-        # if shuffle:
-        #     dataset = dataset.shuffle(shuffle_buffer_size, reshuffle_each_iteration=True)
-        
         dataset = dataset.batch(batch_size)
         dataset = dataset.prefetch(1)
-        self.next_batch = dataset.make_one_shot_iterator().get_next()
+        
+        self.dataset = dataset
+        self.endofstream = False
         self.session = None
 
+        if tf.__version__.startswith('1.'):
+            self.iterator = dataset.make_one_shot_iterator()
+            self.next_batch = self.iterator.get_next()
+        else:
+            self.iterator = iter(dataset)
+            self.next_batch = None
+            
+    def get_next(self):
+        # Override get_next to use similar logic if needed, but inheriting StreamReader.get_next SHOULD work
+        # providing we set self.dataset/iterator correctly.
+        # But StreamReader.get_next uses 'self.dataset' checks now which is good.
+        val = super().get_next()
+        if hasattr(val, 'numpy'):
+            return val.numpy()
+        return val
 
 class StreamSamplerTest(StreamSampler):
     def __init__(

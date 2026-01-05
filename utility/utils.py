@@ -53,8 +53,16 @@ def init_process(rank, world_size):
 
     # initialize the process group
     os.environ["RANK"] = str(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size, )
-    torch.cuda.set_device(rank)
+    
+    # Chọn backend phù hợp: nccl cho GPU, gloo cho CPU
+    if torch.cuda.is_available():
+        backend = "nccl"
+        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+    else:
+        backend = "gloo"
+        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        logging.info(f"[init_process] Using '{backend}' backend (CPU mode).")
 
     # Explicitly setting seed to make sure that models created in two processes
     # start from same random weights and biases.

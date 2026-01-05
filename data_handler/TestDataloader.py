@@ -94,20 +94,43 @@ class DataLoaderTest(IterableDataset):
         self.sampler.__iter__()
 
 
+    # def __next__(self):
+    #     if self.end and self.aval_count == 0:
+    #         raise StopIteration
+
+    #     if self.enable_prefetch:
+    #         next_batch = self.outputs.get()
+    #         self.outputs.task_done()
+    #         self.aval_count -= 1
+    #     else:
+    #         next_batch = self._process(self.sampler.__next__())
+    #     return next_batch
     def __next__(self):
-        if self.end and self.aval_count == 0:
+        # Nếu đã hết dữ liệu và hàng đợi trống thì dừng
+        if self.end and self.outputs.empty():
             raise StopIteration
 
         if self.enable_prefetch:
-            next_batch = self.outputs.get()
-            self.outputs.task_done()
-            self.aval_count -= 1
+            while True:
+                if self.end and self.outputs.empty():
+                    raise StopIteration
+                try:
+                    # Wait 1s then check status again
+                    next_batch = self.outputs.get(timeout=1) 
+                    self.outputs.task_done()
+                    self.aval_count -= 1
+                    return next_batch
+                except:
+                    # Timeout (empty), check loop condition again
+                    continue
         else:
             next_batch = self._process(self.sampler.__next__())
         return next_batch
 
     def trans_to_nindex(self, nids):
-        return [self.news_index[i] if i in self.news_index else 0 for i in nids]
+        # self.news_index đã là dict (được truyền từ news_info.news_index)
+        target_dict = self.news_index
+        return [target_dict[i] if i in target_dict else 0 for i in nids]
 
     def pad_to_fix_len(self, x, fix_length, padding_front=True, padding_value=0):
         if padding_front:
@@ -138,8 +161,10 @@ class DataLoaderTest(IterableDataset):
                 if self.stopped:
                     break
                 context = self._process(batch)
-                self.outputs.put(context)
-                self.aval_count += 1
+                # Skip None results (empty batches)
+                if context is not None:
+                    self.outputs.put(context)
+                    self.aval_count += 1
                 # logging.info(f"_produce cost:{time.time()-t0}")
                 # t0 = time.time()
             self.end = True
@@ -148,43 +173,98 @@ class DataLoaderTest(IterableDataset):
             self.pool.shutdown(wait=False)
             raise
 
+    # def _process(self, batch):
+    #     batch = [x.decode(encoding="utf-8").split("\t") for x in batch]
+
+    #     user_feature_batch, log_mask_batch, news_feature_batch, news_bias_batch, label_batch = [], [], [], [], []
+
+    #     for line in batch:
+    #         click_docs = [i for i in line[2].split()]
+
+    #         click_docs, log_mask  = self.pad_to_fix_len(self.trans_to_nindex(click_docs),
+    #                                          self.args.user_log_length)
+    #         user_feature = self.news_scoring[click_docs]
+
+    #         sess_pos = [i.split(":")[0] for i in line[3].split()]
+    #         sess_neg = [i for i in line[4].split()]
+    #         sess_pos = self.trans_to_nindex(sess_pos)
+    #         sess_neg = self.trans_to_nindex(sess_neg)
+
+    #         sample_news = sess_pos + sess_neg
+
+    #         labels = [1] * len(sess_pos) + [0] * len(sess_neg)
+
+    #         news_feature = self.news_scoring[sample_news]
+    #         user_feature_batch.append(user_feature)
+    #         log_mask_batch.append(log_mask)
+    #         news_feature_batch.append(news_feature)
+    #         label_batch.append(np.array(labels))
+
+    #     if self.enable_gpu:
+    #         user_feature_batch = torch.FloatTensor(user_feature_batch).cuda()
+    #         log_mask_batch = torch.FloatTensor(log_mask_batch).cuda()
+
+    #     else:
+    #         user_feature_batch = torch.FloatTensor(user_feature_batch)
+    #         log_mask_batch = torch.FloatTensor(log_mask_batch)
+
+    #     return user_feature_batch, log_mask_batch, news_feature_batch, label_batch
     def _process(self, batch):
-        batch = [x.decode(encoding="utf-8").split("\t") for x in batch]
+        # Tách cột an toàn
+        decoded_batch = []
+        for x in batch:
+            line = x.decode(encoding="utf-8").split("\t")
+            if len(line) >= 5: # Đảm bảo đủ cột ImpressionID, UserID, History, Pos, Neg
+                decoded_batch.append(line)
 
-        user_feature_batch, log_mask_batch, news_feature_batch, news_bias_batch, label_batch = [], [], [], [], []
+        user_feature_batch, log_mask_batch, news_feature_batch, label_batch = [], [], [], []
 
-        for line in batch:
-            click_docs = [i for i in line[2].split()]
+        for line in decoded_batch:
+            try:
+                click_docs_raw = line[2].split() # History
+                
+                # Chuyển đổi và padding history
+                click_docs, log_mask = self.pad_to_fix_len(
+                    self.trans_to_nindex(click_docs_raw),
+                    self.args.user_log_length
+                )
+                
+                # Lấy embedding của tin đã đọc từ news_scoring
+                user_feature = self.news_scoring[click_docs]
 
-            click_docs, log_mask  = self.pad_to_fix_len(self.trans_to_nindex(click_docs),
-                                             self.args.user_log_length)
-            user_feature = self.news_scoring[click_docs]
+                # Xử lý tin Click (Positive) và Non-click (Negative)
+                # MIND format: line[3] thường là 'N123:1' hoặc 'N123'
+                sess_pos_raw = [i.split(":")[0] for i in line[3].split()]
+                sess_neg_raw = [i for i in line[4].split()]
+                
+                sess_pos = self.trans_to_nindex(sess_pos_raw)
+                sess_neg = self.trans_to_nindex(sess_neg_raw)
 
-            sess_pos = [i.split(":")[0] for i in line[3].split()]
-            sess_neg = [i for i in line[4].split()]
-            sess_pos = self.trans_to_nindex(sess_pos)
-            sess_neg = self.trans_to_nindex(sess_neg)
+                sample_news = sess_pos + sess_neg
+                labels = [1] * len(sess_pos) + [0] * len(sess_neg)
 
-            sample_news = sess_pos + sess_neg
+                # Trích xuất news features
+                news_feature = self.news_scoring[sample_news]
+                
+                user_feature_batch.append(user_feature)
+                log_mask_batch.append(log_mask)
+                news_feature_batch.append(news_feature)
+                label_batch.append(np.array(labels))
+            except Exception as e:
+                continue # Bỏ qua dòng lỗi
 
-            labels = [1] * len(sess_pos) + [0] * len(sess_neg)
+        if not user_feature_batch:
+            return None # Trả về None nếu batch rỗng
 
-            news_feature = self.news_scoring[sample_news]
-            user_feature_batch.append(user_feature)
-            log_mask_batch.append(log_mask)
-            news_feature_batch.append(news_feature)
-            label_batch.append(np.array(labels))
-
+        # Chuyển sang Tensor
         if self.enable_gpu:
-            user_feature_batch = torch.FloatTensor(user_feature_batch).cuda()
-            log_mask_batch = torch.FloatTensor(log_mask_batch).cuda()
-
+            user_feature_batch = torch.FloatTensor(np.array(user_feature_batch)).cuda()
+            log_mask_batch = torch.FloatTensor(np.array(log_mask_batch)).cuda()
         else:
-            user_feature_batch = torch.FloatTensor(user_feature_batch)
-            log_mask_batch = torch.FloatTensor(log_mask_batch)
+            user_feature_batch = torch.FloatTensor(np.array(user_feature_batch))
+            log_mask_batch = torch.FloatTensor(np.array(log_mask_batch))
 
         return user_feature_batch, log_mask_batch, news_feature_batch, label_batch
-
 
 
 

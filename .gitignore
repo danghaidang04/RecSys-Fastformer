@@ -1,23 +1,38 @@
-# Loại bỏ các thư mục dữ liệu và mô hình (Nặng, không đẩy lên web)
-data/
-models/
-speedy_data/
-*.pt
-*.pth
-*.bin
-*.ckpt
-
-# Loại bỏ các file rác của Python và hệ thống
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
-.env
-.venv
-env/
-venv/
+*.pyc
+
+# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
-# Loại bỏ logs và kết quả huấn luyện
-logs/
-results/
+# Data files (too large for GitHub)
+data/
+speedy_data/
+
+# Saved models (too large for GitHub)
+saved_models/
+
+# Pre-trained BERT model
+models/bert-tiny/
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Logs
 *.log
+logs/

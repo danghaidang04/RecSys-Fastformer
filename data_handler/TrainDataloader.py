@@ -66,7 +66,8 @@ class DataLoaderTrainForSpeedyRec(IterableDataset):
         self.news_index = news_index
 
         self.data_files = data_files
-        self.sub_files = [x for x in data_files]
+        self.sub_files = list(data_files)
+        logging.info(f"Dataloader nhận được {len(self.sub_files)} files để huấn luyện.")
         self.batch_size = args.batch_size*args.world_size
 
         self.cache_state = [-args.max_step_in_cache - 1000]*len(news_features)
@@ -92,13 +93,25 @@ class DataLoaderTrainForSpeedyRec(IterableDataset):
         self.pool.submit(self._produce)
 
 
+    # def __next__(self):
+    #     dist.barrier()
+    #     while self.aval_count == 0:
+    #         if self.local_end or self.global_end.value:
+    #             self.global_end.value=True
+    #             break
+    #     dist.barrier()
+    #     if self.global_end.value:
+    #         raise StopIteration
+    #     next_batch = self.outputs.get()
+    #     self.aval_count -= 1
+    #     return next_batch
+
     def __next__(self):
-        dist.barrier()
+    # XÓA HẾT dist.barrier() Ở ĐÂY
         while self.aval_count == 0:
             if self.local_end or self.global_end.value:
-                self.global_end.value=True
+                self.global_end.value = True
                 break
-        dist.barrier()
         if self.global_end.value:
             raise StopIteration
         next_batch = self.outputs.get()
@@ -135,11 +148,10 @@ class DataLoaderTrainForSpeedyRec(IterableDataset):
         if self.args.enable_gpu:
             torch.cuda.set_device(self.local_rank)
 
-        self.sampler_batch = StreamReaderForSpeedy(
-            file=self.sub_files,
-            batch_size=self.batch_size
-            )
-
+        #self.sampler_batch = StreamReaderForSpeedy(file=self.sub_files,batch_size=self.batch_size)
+        valid_files = [f for f in self.sub_files if os.path.exists(f)]
+        self.sampler_batch = StreamReaderForSpeedy(file=valid_files, batch_size=self.batch_size)
+        
         for batch in self.sampler_batch:
             news_set, uid_click_docs, uid_sample_news = self._process(batch)
             cache_set, encode_set = self.split_news_set(news_set, self.use_cache)
@@ -268,39 +280,98 @@ class DataLoaderTrainForSpeedyRec(IterableDataset):
                start_inx, end_inx, \
                (input_ids, hist_sequence, hist_sequence_mask, candidate_inx, label_batch)
 
+    # def _process(self, batch):
+    #     random.seed(self.global_step)
+
+    #     batch = [x.decode(encoding="utf-8").split("\t") for x in batch]
+    #     news_set, behavior_set, uid_click_docs, uid_sample_news = [], [], [], []
+    #     for line in batch:
+    #         click_docs = [i for i in line[2].split()]
+    #         poss = line[3]
+
+    #         click_docs = self.trans_to_nindex(click_docs)[-self.args.user_log_length:]
+    #         sess_neg = [i for i in line[4].split()]
+    #         poss = self.trans_to_nindex([poss])
+    #         sess_neg = self.trans_to_nindex(sess_neg)
+
+    #         if len(sess_neg) > 0:
+    #             neg_index = self.news_sample(list(range(len(sess_neg))),
+    #                                     self.args.npratio)
+    #             sam_negs = [sess_neg[i] for i in neg_index]
+    #         else:
+    #             sam_negs = [0] * self.args.npratio
+
+    #         sample_news = poss + sam_negs
+
+    #         news_set.extend(sample_news+click_docs)
+
+    #         uid_click_docs.append(click_docs)
+    #         uid_sample_news.append(sample_news)
+
+    #     news_set = set(news_set)
+    #     return news_set, uid_click_docs, uid_sample_news
+
     def _process(self, batch):
+        # Đảm bảo tính ngẫu nhiên nhưng có thể tái lập
         random.seed(self.global_step)
-        batch = [x.decode(encoding="utf-8").split("\t") for x in batch]
-        news_set, behavior_set, uid_click_docs, uid_sample_news = [], [], [], []
-        for line in batch:
-            click_docs = [i for i in line[2].split()]
-            poss = line[3]
+        
+        news_set, uid_click_docs, uid_sample_news = [], [], []
+        
+        for x in batch:
+            try:
+                # 1. Giải mã và tách cột bằng dấu TAB
+                line = x.decode(encoding="utf-8").split("\t")
+                
+                # Kiểm tra dòng dữ liệu có đủ 5 cột (ImpressionID, UserID, History, Pos, Neg)
+                if len(line) < 5:
+                    continue
 
-            click_docs = self.trans_to_nindex(click_docs)[-self.args.user_log_length:]
-            sess_neg = [i for i in line[4].split()]
-            poss = self.trans_to_nindex([poss])
-            sess_neg = self.trans_to_nindex(sess_neg)
+                # 2. Trích xuất dữ liệu thô từ các cột
+                click_docs_raw = line[2].split()  # Danh sách ID lịch sử
+                poss_raw = line[3]               # ID bài báo được click
+                sess_neg_raw = line[4].split()    # Danh sách ID không click
 
-            if len(sess_neg) > 0:
-                neg_index = self.news_sample(list(range(len(sess_neg))),
-                                        self.args.npratio)
-                sam_negs = [sess_neg[i] for i in neg_index]
-            else:
-                sam_negs = [0] * self.args.npratio
+                # 3. Chuyển đổi ID (Nxxx) sang Index (số nguyên) dựa trên news_index
+                click_docs = self.trans_to_nindex(click_docs_raw)[-self.args.user_log_length:]
+                poss = self.trans_to_nindex([poss_raw])
+                if self.global_step % 100 == 0: # Cứ 100 step in 1 lần để tránh rác log
+                    print(f"Debug ID: Raw={poss_raw}, Index={poss}")
+                sess_neg = self.trans_to_nindex(sess_neg_raw)
 
-            sample_news = poss + sam_negs
+                # Nếu không tìm thấy index cho tin Positive (bị trả về 0), bỏ qua dòng này
+                if not poss or poss[0] == 0:
+                    continue
 
-            news_set.extend(sample_news+click_docs)
+                # 4. Thực hiện Negative Sampling (Lấy mẫu tin tiêu cực)
+                if len(sess_neg) > 0:
+                    # Lấy mẫu ngẫu nhiên theo npratio
+                    neg_index = self.news_sample(list(range(len(sess_neg))), self.args.npratio)
+                    sam_negs = [sess_neg[i] for i in neg_index]
+                else:
+                    # Nếu không có tin tiêu cực, dùng padding (0)
+                    sam_negs = [0] * self.args.npratio
 
-            uid_click_docs.append(click_docs)
-            uid_sample_news.append(sample_news)
+                # 5. Tổng hợp dữ liệu batch
+                sample_news = poss + sam_negs # [Positive, Neg1, Neg2, ...]
+                
+                # Gom tất cả news index lại để model encode một lượt
+                news_set.extend(sample_news + click_docs)
 
-        news_set = set(news_set)
-        return news_set, uid_click_docs, uid_sample_news
+                uid_click_docs.append(click_docs)
+                uid_sample_news.append(sample_news)
+
+            except Exception:
+                # Nếu có bất kỳ lỗi parse dữ liệu nào, bỏ qua dòng đó và tiếp tục dòng sau
+                continue
+
+        # Trả về set các news index cần encode và cấu trúc dữ liệu user
+        return set(news_set), uid_click_docs, uid_sample_news
 
 
     def trans_to_nindex(self, nids):
-        return [self.news_index[i] if i in self.news_index else 0 for i in nids]
+        # self.news_index đã là dict (được truyền từ news_info.news_index trong train.py)
+        target_dict = self.news_index
+        return [target_dict[i] if i in target_dict else 0 for i in nids]
 
     def trans_to_batchindex(self, nids, news_index):
         return [news_index[i] for i in nids]
